@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex MCP Localize"
+  short_description: "Pin and update Codex MCP servers locally"
+  default_prompt: "Use $codex-mcp-localize to inspect my Codex config.toml MCP servers and prepare local pinned installs."
