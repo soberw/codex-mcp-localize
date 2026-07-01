@@ -122,13 +122,17 @@ def main() -> int:
         if not selected:
             print("No matching MCP servers found.", file=sys.stderr)
             return 2
-        for info in selected:
-            install_one(info, root, timeout=args.timeout, dry_run=args.dry_run)
-        if not args.dry_run:
-            save_state(root, selected)
+        installed, failed = install_selected(
+            selected,
+            root,
+            timeout=args.timeout,
+            dry_run=args.dry_run,
+        )
+        if installed and not args.dry_run:
+            save_state(root, installed)
         print(render_markdown(selected))
         print("\nRun `config-snippets` for first-time config.toml migration.")
-        return 0
+        return 1 if failed else 0
 
     if args.command == "config-snippets":
         infos = audit_config(
@@ -367,14 +371,36 @@ def get_installed_version(
             return data.get("version")
         return None
 
-    state = load_state(root).get("servers", {}).get(server.name, {})
-    if state.get("installed_version"):
-        return state["installed_version"]
+    if server.manager == "uv":
+        return uv_tool_versions(timeout).get(package_key(server.package))
+
     return None
 
 
 def npm_package_json_path(root: Path, package: str) -> Path:
     return root / "npm" / "node_modules" / Path(package) / "package.json"
+
+
+def uv_tool_versions(timeout: int) -> dict[str, str]:
+    output = run_text(["uv", "tool", "list"], timeout=timeout)
+    return parse_uv_tool_list(output)
+
+
+def parse_uv_tool_list(output: str) -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("-"):
+            continue
+        match = re.match(r"^(?P<package>\S+)\s+v?(?P<version>\d[^\s]*)", line)
+        if match:
+            versions[package_key(match.group("package"))] = match.group("version")
+    return versions
+
+
+def package_key(package: str) -> str:
+    base = package.split("[", 1)[0]
+    return re.sub(r"[-_.]+", "-", base).lower()
 
 
 def npm_metadata(package: str, timeout: int) -> dict[str, Any]:
@@ -686,14 +712,49 @@ def install_one(info: PackageInfo, root: Path, timeout: int, dry_run: bool) -> N
         return
 
     if server.manager == "uv":
+        if versions_equal(info.installed_version, version):
+            print(
+                f"# {server.name}: {server.package}=={version} already installed; "
+                "skipping uv tool install."
+            )
+            info.status = "current"
+            return
         command = ["uv", "tool", "install", f"{server.package}=={version}"]
         print("$ " + " ".join(command))
         if not dry_run:
             run_text(command, timeout=timeout * 4)
             info.installed_version = version
+            info.status = status_for(info.installed_version, info.remote_version)
         return
 
     raise RuntimeError(f"Unsupported manager: {server.manager}")
+
+
+def versions_equal(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return normalize_version(left) == normalize_version(right)
+
+
+def install_selected(
+    selected: list[PackageInfo],
+    root: Path,
+    timeout: int,
+    dry_run: bool,
+) -> tuple[list[PackageInfo], list[PackageInfo]]:
+    installed: list[PackageInfo] = []
+    failed: list[PackageInfo] = []
+    for info in selected:
+        try:
+            install_one(info, root, timeout=timeout, dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001
+            info.status = "install-failed"
+            info.errors.append(f"install failed: {exc}")
+            failed.append(info)
+            print(f"{info.server.name}: install failed: {exc}", file=sys.stderr)
+            continue
+        installed.append(info)
+    return installed, failed
 
 
 def save_state(root: Path, infos: list[PackageInfo]) -> None:
